@@ -1,0 +1,1746 @@
+name: Add Shizuku backend support
+
+# Workflow de migração única: escreve os arquivos novos/alterados do
+# suporte a Shizuku, builda um APK debug pra validar e commita tudo de
+# volta no repositório. Rode uma vez (Actions -> Add Shizuku backend
+# support -> Run workflow) e depois pode apagar este arquivo.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  add-shizuku:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute next app version
+        id: version
+        run: |
+          CURRENT_CODE=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts)
+          CURRENT_NAME=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts)
+          NEW_CODE=$((CURRENT_CODE + 1))
+          BASE=$(echo "$CURRENT_NAME" | grep -oP '^[0-9]+\.[0-9]+')
+          SUFFIX="${CURRENT_NAME#$BASE}"
+          MAJOR=$(echo "$BASE" | cut -d. -f1)
+          MINOR=$(echo "$BASE" | cut -d. -f2)
+          NEW_MINOR=$((MINOR + 1))
+          NEW_NAME="${MAJOR}.${NEW_MINOR}${SUFFIX}"
+          echo "Versão: $CURRENT_CODE ($CURRENT_NAME) -> $NEW_CODE ($NEW_NAME)"
+          echo "code=$NEW_CODE" >> "$GITHUB_OUTPUT"
+          echo "name=$NEW_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Write new files (Shizuku backend)
+        run: |
+          mkdir -p app/src/main/aidl/com/game/reschange
+          mkdir -p app/src/main/java/com/game/reschange
+          mkdir -p app/src/main/res/layout
+
+          cat > app/src/main/aidl/com/game/reschange/IShellService.aidl << 'EOF'
+          // AIDL usado pelo UserService do Shizuku. Roda em processo separado,
+          // com UID de shell (2000) ou root (0) dependendo de como o Shizuku foi
+          // iniciado -- nunca com a identidade normal do app.
+          package com.game.reschange;
+
+          interface IShellService {
+              String exec(String command) = 1;
+
+              // Codigo de transacao fixo que o Shizuku usa para encerrar o
+              // servico ao trocar de versao (ver ShellUserService.destroy()).
+              void destroy() = 16777114;
+          }
+          EOF
+
+          cat > app/src/main/java/com/game/reschange/BackendPrefs.kt << 'EOF'
+          package com.game.reschange
+
+          import android.content.Context
+
+          /**
+           * Guarda qual backend de execucao privilegiada o usuario escolheu:
+           * root (su) ou Shizuku (UserService, sem necessidade de root).
+           * Separado do ModePrefs (Default/Alternative), que decide COMO a
+           * resolucao e aplicada -- este aqui decide COM QUE PERMISSAO.
+           */
+          object BackendPrefs {
+              private const val PREF_NAME = "backend_prefs"
+              private const val KEY_BACKEND = "privileged_backend"
+              private const val KEY_CHOOSER_DONE = "chooser_done"
+
+              const val BACKEND_ROOT    = "root"
+              const val BACKEND_SHIZUKU = "shizuku"
+
+              fun getBackend(context: Context): String {
+                  return context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                      .getString(KEY_BACKEND, BACKEND_ROOT) ?: BACKEND_ROOT
+              }
+
+              fun saveBackend(context: Context, backend: String) {
+                  context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                      .edit().putString(KEY_BACKEND, backend).apply()
+              }
+
+              fun isShizuku(context: Context): Boolean = getBackend(context) == BACKEND_SHIZUKU
+
+              /** true assim que o usuario ja passou pela tela inicial de escolha. */
+              fun isChooserDone(context: Context): Boolean {
+                  return context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                      .getBoolean(KEY_CHOOSER_DONE, false)
+              }
+
+              fun setChooserDone(context: Context) {
+                  context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                      .edit().putBoolean(KEY_CHOOSER_DONE, true).apply()
+              }
+
+              /** Texto curto pro subtitulo do toolbar ("Root ativo" / "Shizuku ativo"). */
+              fun label(context: Context): String {
+                  return if (isShizuku(context)) "Shizuku ativo" else "Root ativo"
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/game/reschange/ShellUserService.kt << 'EOF'
+          package com.game.reschange
+
+          /**
+           * Roda no processo separado que o Shizuku cria (nao e um processo de
+           * app normal -- Context aqui nao se comporta como numa Activity/Service
+           * comuns). Todo comando chega aqui ja com privilegio de shell ou root,
+           * entao nao precisa de "su" -- e so ProcessBuilder direto.
+           */
+          class ShellUserService : IShellService.Stub() {
+
+              override fun exec(command: String): String {
+                  return try {
+                      val process = ProcessBuilder("sh", "-c", command)
+                          .redirectErrorStream(true)
+                          .start()
+                      val output = process.inputStream.bufferedReader().readText()
+                      process.waitFor()
+                      output
+                  } catch (e: Exception) {
+                      "EXEC_FAILED: ${e.message}"
+                  }
+              }
+
+              override fun destroy() {
+                  System.exit(0)
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/game/reschange/ShizukuExecutor.kt << 'EOF'
+          package com.game.reschange
+
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.ServiceConnection
+          import android.content.pm.PackageManager
+          import android.os.IBinder
+          import rikka.shizuku.Shizuku
+          import java.util.concurrent.TimeUnit
+
+          /**
+           * Ponte para o Shizuku. Mantem uma UserService vinculada (processo
+           * separado, mesma ideia de exec que o app ja usa via su, so que sem
+           * precisar de root) e expoe chamadas bloqueantes equivalentes ao antigo
+           * runAsRoot()/runAsRootWithOutput(), pra encaixar sem reescrever
+           * WatcherManager/GameCategoryHint/MainActivity por completo.
+           */
+          object ShizukuExecutor {
+
+              // Versao do CONTRATO do servico (metodos da AIDL), nao a versionCode
+              // do app -- so precisa mudar se a interface IShellService mudar.
+              private const val SERVICE_VERSION = 1
+              private const val BIND_TIMEOUT_SECONDS = 10L
+
+              @Volatile private var service: IShellService? = null
+              private val bindLock = Object()
+
+              private val connection = object : ServiceConnection {
+                  override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+                      service = if (binder?.isBinderAlive == true) IShellService.Stub.asInterface(binder) else null
+                      synchronized(bindLock) { bindLock.notifyAll() }
+                  }
+
+                  override fun onServiceDisconnected(name: ComponentName?) {
+                      service = null
+                  }
+              }
+
+              private fun args(context: Context) = Shizuku.UserServiceArgs(
+                  ComponentName(context.packageName, ShellUserService::class.java.name)
+              )
+                  .processNameSuffix("shell_service")
+                  .debuggable(false)
+                  .version(SERVICE_VERSION)
+                  .daemon(true)
+
+              /** Shizuku instalado e respondendo (nao diz nada sobre permissao). */
+              fun isAvailable(): Boolean {
+                  return try {
+                      Shizuku.pingBinder() && Shizuku.getVersion() >= 11
+                  } catch (_: Throwable) {
+                      false
+                  }
+              }
+
+              fun hasPermission(): Boolean {
+                  return try {
+                      isAvailable() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+                  } catch (_: Throwable) {
+                      false
+                  }
+              }
+
+              /**
+               * Dispara o dialogo de permissao do Shizuku. O resultado nao vem por
+               * callback aqui -- quem chama deve reconferir hasPermission() no
+               * onResume() da Activity depois que o usuario voltar da tela do
+               * Shizuku (ver BackendChooserActivity / SettingsActivity).
+               */
+              fun requestPermission(requestCode: Int) {
+                  if (isAvailable() && !hasPermission()) {
+                      Shizuku.requestPermission(requestCode)
+                  }
+              }
+
+              @Synchronized
+              private fun ensureBound(context: Context): IShellService? {
+                  service?.let { if (it.asBinder().isBinderAlive) return it }
+                  if (!hasPermission()) return null
+                  synchronized(bindLock) {
+                      Shizuku.bindUserService(args(context.applicationContext), connection)
+                      if (service == null) {
+                          bindLock.wait(TimeUnit.SECONDS.toMillis(BIND_TIMEOUT_SECONDS))
+                      }
+                  }
+                  return service
+              }
+
+              fun runCommand(context: Context, command: String) {
+                  try {
+                      ensureBound(context)?.exec(command)
+                  } catch (_: Exception) {
+                  }
+              }
+
+              fun runCommandWithOutput(context: Context, command: String): String {
+                  return try {
+                      ensureBound(context)?.exec(command) ?: "SHIZUKU_UNAVAILABLE"
+                  } catch (e: Exception) {
+                      "EXEC_FAILED: ${e.message}"
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/game/reschange/PrivilegedExecutor.kt << 'EOF'
+          package com.game.reschange
+
+          import android.content.Context
+          import java.io.DataOutputStream
+
+          /**
+           * Ponto unico de execucao privilegiada do app.
+           *
+           * Antes, cada arquivo (WatcherManager, GameCategoryHint, MainActivity,
+           * SettingsActivity) tinha sua propria copia de runAsRoot() via
+           * Runtime.exec("su"). Agora todos passam por aqui, que decide entre
+           * root (su) e Shizuku (UserService) de acordo com BackendPrefs -- o
+           * resto do app nao precisa saber qual dos dois esta rodando por baixo.
+           */
+          object PrivilegedExecutor {
+
+              /** Roda um comando descartando a saida (equivalente ao antigo runAsRoot). */
+              fun run(context: Context, command: String) {
+                  when (BackendPrefs.getBackend(context)) {
+                      BackendPrefs.BACKEND_SHIZUKU -> ShizukuExecutor.runCommand(context, command)
+                      else -> suExec(command, asShellUid = false)
+                  }
+              }
+
+              /** Roda um comando e devolve stdout+stderr (equivalente ao antigo runAsRootWithOutput). */
+              fun runWithOutput(context: Context, command: String): String {
+                  return when (BackendPrefs.getBackend(context)) {
+                      BackendPrefs.BACKEND_SHIZUKU -> ShizukuExecutor.runCommandWithOutput(context, command)
+                      else -> suExec(command, asShellUid = false)
+                  }
+              }
+
+              /**
+               * Especifico do GameCategoryHint: precisa rodar como UID de shell
+               * (2000), nao root (0), porque o metodo oculto valida a UID de quem
+               * chama. No root isso exige "su 2000" (nem toda gerenciadora aceita).
+               * No Shizuku isso e automatico -- uma sessao iniciada via ADB/wireless
+               * debugging ja roda nativamente como UID 2000.
+               */
+              fun runAsShellUid(context: Context, command: String): String {
+                  return when (BackendPrefs.getBackend(context)) {
+                      BackendPrefs.BACKEND_SHIZUKU -> ShizukuExecutor.runCommandWithOutput(context, command)
+                      else -> suExec(command, asShellUid = true)
+                  }
+              }
+
+              private fun suExec(command: String, asShellUid: Boolean): String {
+                  return try {
+                      val process = if (asShellUid)
+                          Runtime.getRuntime().exec(arrayOf("su", "2000"))
+                      else
+                          Runtime.getRuntime().exec("su")
+                      val os = DataOutputStream(process.outputStream)
+                      os.writeBytes("$command\n")
+                      os.writeBytes("exit\n")
+                      os.flush()
+                      os.close()
+                      val output = process.inputStream.bufferedReader().readText()
+                      val errOutput = process.errorStream.bufferedReader().readText()
+                      process.waitFor()
+                      output + errOutput
+                  } catch (e: Exception) {
+                      "EXEC_FAILED: ${e.message}"
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/game/reschange/BackendChooserActivity.kt << 'EOF'
+          package com.game.reschange
+
+          import android.content.Intent
+          import android.os.Bundle
+          import android.widget.Toast
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.cardview.widget.CardView
+          import androidx.core.view.WindowCompat
+
+          /**
+           * Tela mostrada apenas na primeira execucao do app, antes da MainActivity,
+           * para escolher o backend de execucao privilegiada (root ou Shizuku).
+           * Pode ser trocado depois em Settings -- ver BackendPrefs/SettingsActivity.
+           */
+          class BackendChooserActivity : AppCompatActivity() {
+
+              private var awaitingShizukuPermission = false
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  WindowCompat.setDecorFitsSystemWindows(window, false)
+                  setContentView(R.layout.activity_backend_chooser)
+
+                  findViewById<CardView>(R.id.cardRoot).setOnClickListener {
+                      BackendPrefs.saveBackend(this, BackendPrefs.BACKEND_ROOT)
+                      finishChooser()
+                  }
+
+                  findViewById<CardView>(R.id.cardShizuku).setOnClickListener {
+                      when {
+                          ShizukuExecutor.hasPermission() -> {
+                              BackendPrefs.saveBackend(this, BackendPrefs.BACKEND_SHIZUKU)
+                              finishChooser()
+                          }
+                          ShizukuExecutor.isAvailable() -> {
+                              awaitingShizukuPermission = true
+                              ShizukuExecutor.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE)
+                              Toast.makeText(this,
+                                  "Conceda a permissão do Shizuku na tela que abriu.",
+                                  Toast.LENGTH_LONG).show()
+                          }
+                          else -> {
+                              Toast.makeText(this,
+                                  "Shizuku não detectado. Instale e inicie o Shizuku, ou escolha Root.",
+                                  Toast.LENGTH_LONG).show()
+                          }
+                      }
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  if (awaitingShizukuPermission) {
+                      awaitingShizukuPermission = false
+                      if (ShizukuExecutor.hasPermission()) {
+                          BackendPrefs.saveBackend(this, BackendPrefs.BACKEND_SHIZUKU)
+                          finishChooser()
+                      } else {
+                          Toast.makeText(this, "Permissão do Shizuku não concedida.", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+              }
+
+              private fun finishChooser() {
+                  BackendPrefs.setChooserDone(this)
+                  startActivity(Intent(this, MainActivity::class.java))
+                  finish()
+              }
+
+              companion object {
+                  private const val SHIZUKU_PERMISSION_REQUEST_CODE = 7788
+              }
+          }
+          EOF
+
+          cat > app/src/main/res/layout/activity_backend_chooser.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:app="http://schemas.android.com/apk/res-auto"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:gravity="center"
+              android:padding="24dp"
+              android:fitsSystemWindows="true">
+
+              <TextView
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:text="GameResCharge"
+                  android:textSize="26sp"
+                  android:textStyle="bold"
+                  android:paddingBottom="4dp" />
+
+              <TextView
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="Escolha como o app vai aplicar as mudanças de resolução."
+                  android:textSize="14sp"
+                  android:textColor="?android:attr/textColorSecondary"
+                  android:gravity="center"
+                  android:paddingBottom="28dp" />
+
+              <androidx.cardview.widget.CardView
+                  android:id="@+id/cardRoot"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginBottom="16dp"
+                  android:clickable="true"
+                  android:focusable="true"
+                  app:cardCornerRadius="12dp"
+                  app:cardElevation="2dp">
+
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:orientation="vertical"
+                      android:padding="18dp">
+
+                      <TextView
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:text="Root"
+                          android:textStyle="bold"
+                          android:textSize="17sp"
+                          android:paddingBottom="6dp" />
+
+                      <TextView
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:text="Requer Magisk ou KernelSU já instalado no aparelho. O watcher roda em segundo plano de forma independente do app."
+                          android:textSize="13sp"
+                          android:textColor="?android:attr/textColorSecondary" />
+                  </LinearLayout>
+              </androidx.cardview.widget.CardView>
+
+              <androidx.cardview.widget.CardView
+                  android:id="@+id/cardShizuku"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginBottom="8dp"
+                  android:clickable="true"
+                  android:focusable="true"
+                  app:cardCornerRadius="12dp"
+                  app:cardElevation="2dp">
+
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:orientation="vertical"
+                      android:padding="18dp">
+
+                      <TextView
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:text="Shizuku"
+                          android:textStyle="bold"
+                          android:textSize="17sp"
+                          android:paddingBottom="6dp" />
+
+                      <TextView
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:text="Não precisa de root. Requer o app Shizuku instalado e ativo via ADB (PC) ou depuração sem fio."
+                          android:textSize="13sp"
+                          android:textColor="?android:attr/textColorSecondary" />
+                  </LinearLayout>
+              </androidx.cardview.widget.CardView>
+
+              <TextView
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="Isso pode ser trocado depois em Settings."
+                  android:textSize="12sp"
+                  android:textColor="?android:attr/textColorSecondary"
+                  android:gravity="center"
+                  android:paddingTop="12dp" />
+
+          </LinearLayout>
+          EOF
+
+      - name: Patch WatcherManager.kt and GameCategoryHint.kt
+        run: |
+          cat > app/src/main/java/com/game/reschange/WatcherManager.kt << 'EOF'
+          package com.game.reschange
+
+          import android.content.Context
+          import java.io.File
+
+          /**
+           * Copia reschange_watcher.sh de assets/ para /data/local/tmp e garante
+           * que ele esteja rodando em background com privilegio elevado (root ou
+           * Shizuku, de acordo com BackendPrefs -- ver PrivilegedExecutor).
+           *
+           * O watcher monitora o app em primeiro plano (mesma tecnica do PerfGame:
+           * `dumpsys window`) e troca a RESOLUCAO REAL DA TELA via `wm size` quando
+           * o app esta na lista configurada -- sem depender de GameManagerService,
+           * CATEGORY_GAME ou Game Space.
+           *
+           * O script em si, uma vez iniciado com nohup e detached, roda como um
+           * processo comum do Linux independente de quem o lancou -- sobrevive
+           * tanto a saida do "su" quanto ao unbind da UserService do Shizuku.
+           */
+          object WatcherManager {
+
+              private const val SCRIPT_PATH = "/data/local/tmp/reschange_watcher.sh"
+
+              fun ensureRunning(context: Context) {
+                  try {
+                      copyScriptIfNeeded(context)
+                      if (!isRunning(context)) {
+                          startWatcher(context)
+                      }
+                  } catch (_: Exception) {}
+              }
+
+              private fun copyScriptIfNeeded(context: Context) {
+                  val target = File(SCRIPT_PATH)
+                  val assetBytes = context.assets.open("reschange_watcher.sh").readBytes()
+
+                  val needsCopy = !target.exists() || !target.readBytes().contentEquals(assetBytes)
+                  if (needsCopy) {
+                      // Escreve num arquivo temporario proprio do app e move via
+                      // backend privilegiado, pois o app nao tem permissao de
+                      // escrever direto em /data/local/tmp.
+                      val tmp = File(context.cacheDir, "reschange_watcher.sh")
+                      tmp.writeBytes(assetBytes)
+                      PrivilegedExecutor.run(
+                          context,
+                          "cp ${tmp.absolutePath} $SCRIPT_PATH && chmod 755 $SCRIPT_PATH"
+                      )
+                  }
+              }
+
+              private fun isRunning(context: Context): Boolean {
+                  val result = PrivilegedExecutor.runWithOutput(context, "pgrep -f reschange_watcher.sh")
+                  return result.trim().isNotEmpty()
+              }
+
+              private fun startWatcher(context: Context) {
+                  // nohup + & para o processo sobreviver depois que o backend
+                  // (su ou a UserService do Shizuku) sair/desconectar
+                  PrivilegedExecutor.run(context, "nohup sh $SCRIPT_PATH > /dev/null 2>&1 &")
+              }
+
+              fun stopWatcher(context: Context) {
+                  PrivilegedExecutor.run(context, "pkill -f reschange_watcher.sh; wm size reset")
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/game/reschange/GameCategoryHint.kt << 'EOF'
+          package com.game.reschange
+
+          import android.content.Context
+
+          /**
+           * Forca a categoria "Jogo" de um pacote-alvo.
+           *
+           * Mecanismo reverso-engenheirado direto do APK do TMPAD (Themed Per-App
+           * Downscale), extraido do classes.dex (strings + tabela de metodos/classes
+           * lida diretamente do formato .dex). Descobertas principais:
+           *
+           * 1) O installer-of-record do pacote-alvo precisa ser especificamente
+           *    "com.android.shell" -- nao o nosso proprio pacote. Reinstala usando o
+           *    fluxo de SESSAO do pm (install-create/install-write/install-commit
+           *    com "-i com.android.shell" e "--bypass-low-target-sdk-block", ambos
+           *    confirmados como strings literais no dex do TMPAD).
+           *
+           * 2) Na chamada `service call package`, o parametro de "pacote chamador"
+           *    tambem precisa ser literalmente "com.android.shell".
+           *
+           * 3) VERIFICACAO REAL: a tabela de metodos do dex do TMPAD referencia
+           *    PackageManager.getApplicationInfo() e ApplicationInfoFlags.of() --
+           *    APIs publicas e documentadas (nao hidden API, category e um campo
+           *    publico do ApplicationInfo desde a API 26). Entao a verificacao mais
+           *    provavel e simplesmente reler getApplicationInfo(pkg).category e
+           *    conferir se bateu CATEGORY_GAME, em vez de confiar no texto de saida
+           *    do `service call` (que pode "parecer sucesso" sem ter feito nada).
+           *
+           * 4) A identidade de quem chama precisa ser UID de shell (2000), nao UID
+           *    0 de root puro -- por isso tudo aqui roda via
+           *    PrivilegedExecutor.runAsShellUid(), que usa "su 2000" no backend
+           *    root (nem toda gerenciadora suporta bem) ou, no backend Shizuku, ja
+           *    roda como shell de forma nativa -- e exatamente essa exigencia que
+           *    o Shizuku foi desenhado pra resolver.
+           */
+          object GameCategoryHint {
+
+              private const val PREF_NAME = "category_hint_prefs"
+              private const val KEY_CODE = "working_code_global"
+              private const val KEY_FORCED_SET = "forced_pkgs"
+              const val CATEGORY_GAME = 0
+              private const val CATEGORY_UNDEFINED = -1
+              private const val SHELL_PKG = "com.android.shell"
+
+              // Mesmos codigos de transacao conhecidos que o TMPAD oferece
+              val KNOWN_CODES = intArrayOf(50, 49, 47)
+
+              data class Result(val success: Boolean, val codeUsed: Int, val message: String)
+
+              fun forceGameCategory(context: Context, pkg: String): Result {
+                  val result = runCategoryChange(context, pkg, CATEGORY_GAME)
+                  if (result.success) markForced(context, pkg)
+                  return result
+              }
+
+              /**
+               * Remove a categoria de jogo forcada anteriormente, voltando o pacote
+               * para CATEGORY_UNDEFINED. So faz sentido chamar em pacotes que a gente
+               * mesmo forcou (isForcedByUs) -- reverter um jogo de verdade nao e o
+               * objetivo aqui.
+               */
+              fun removeGameCategory(context: Context, pkg: String): Result {
+                  val result = runCategoryChange(context, pkg, CATEGORY_UNDEFINED)
+                  if (result.success) unmarkForced(context, pkg)
+                  return result
+              }
+
+              private fun runCategoryChange(context: Context, pkg: String, targetCategory: Int): Result {
+                  val originalInstaller = getInstaller(context, pkg)
+
+                  // 1) Reinstala o pacote-alvo com com.android.shell como installer
+                  val reinstallOut = reinstallWithInstaller(context, pkg, SHELL_PKG)
+                  val currentInstaller = getInstaller(context, pkg)
+                  if (currentInstaller != SHELL_PKG) {
+                      return Result(
+                          false, -1,
+                          "Reinstalação com installer=com.android.shell falhou. " +
+                              "Installer atual: ${currentInstaller ?: "nenhum"}. Saída: ${reinstallOut.take(250)}"
+                      )
+                  }
+
+                  // 2) Tenta a transacao Binder crua via `service call package`,
+                  // usando com.android.shell como pacote chamador (nao o nosso),
+                  // e verifica de VERDADE lendo getApplicationInfo().category depois
+                  // de cada tentativa -- nao confia so no texto de saida do comando.
+                  val savedCode = getSavedCode(context)
+                  val codesToTry = buildList {
+                      if (savedCode != null) add(savedCode)
+                      addAll(KNOWN_CODES.filter { it != savedCode })
+                  }
+
+                  var workedCode = -1
+                  val attempts = mutableListOf<String>()
+                  for (code in codesToTry) {
+                      val cmdOutput = runServiceCall(context, code, pkg, targetCategory)
+                      val actualCategory = readActualCategory(context, pkg)
+                      if (actualCategory == targetCategory) {
+                          workedCode = code
+                          break
+                      }
+                      attempts.add("$code: categoria lida=$actualCategory (esperado $targetCategory). Saída: ${cmdOutput.take(100).trim()}")
+                  }
+
+                  // 3) Restaura o installer original
+                  if (!originalInstaller.isNullOrBlank() && originalInstaller != SHELL_PKG) {
+                      reinstallWithInstaller(context, pkg, originalInstaller)
+                  }
+
+                  return if (workedCode != -1) {
+                      saveCode(context, workedCode)
+                      val label = if (targetCategory == CATEGORY_GAME) "forçada" else "removida"
+                      Result(true, workedCode, "Categoria de jogo $label e VERIFICADA (código $workedCode, category=$targetCategory confirmado)")
+                  } else {
+                      Result(
+                          false, -1,
+                          "Installer virou com.android.shell, mas em nenhuma tentativa a categoria realmente mudou " +
+                              "(verificado via getApplicationInfo().category). Detalhes: " + attempts.joinToString(" | ")
+                      )
+                  }
+              }
+
+              /**
+               * Le a categoria REAL do pacote via a API publica e documentada do
+               * Android (ApplicationInfo.category, publico desde API 26 -- nao e
+               * hidden API, nao precisa de reflection nem bypass).
+               */
+              fun readActualCategory(context: Context, pkg: String): Int {
+                  return try {
+                      val info = context.packageManager.getApplicationInfo(pkg, 0)
+                      info.category
+                  } catch (e: Exception) {
+                      Int.MIN_VALUE
+                  }
+              }
+
+              /** true se o sistema ja reconhece esse pacote como CATEGORY_GAME. */
+              fun isActuallyGame(context: Context, pkg: String): Boolean {
+                  return readActualCategory(context, pkg) == CATEGORY_GAME
+              }
+
+              /** true se FOMOS nos que forcamos a categoria desse pacote pra jogo. */
+              fun isForcedByUs(context: Context, pkg: String): Boolean {
+                  return context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                      .getStringSet(KEY_FORCED_SET, emptySet())!!.contains(pkg)
+              }
+
+              private fun markForced(context: Context, pkg: String) {
+                  val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                  val set = prefs.getStringSet(KEY_FORCED_SET, emptySet())!!.toMutableSet()
+                  set.add(pkg)
+                  prefs.edit().putStringSet(KEY_FORCED_SET, set).apply()
+              }
+
+              private fun unmarkForced(context: Context, pkg: String) {
+                  val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                  val set = prefs.getStringSet(KEY_FORCED_SET, emptySet())!!.toMutableSet()
+                  set.remove(pkg)
+                  prefs.edit().putStringSet(KEY_FORCED_SET, set).apply()
+              }
+
+              /**
+               * Reinstala pkg preservando dados (-r), com installer especificado,
+               * usando o fluxo de sessao do pm (necessario pra apps com splits/
+               * multiplos APKs -- um `pm install -r -i` simples so aceita um arquivo).
+               * Replica exatamente a sequencia de shell extraida do TMPAD.
+               */
+              private fun reinstallWithInstaller(context: Context, pkg: String, installer: String): String {
+                  val script = """
+                      create_out=$(cmd package install-create -r --bypass-low-target-sdk-block -i $installer 2>&1)
+                      sid=$(echo "${'$'}create_out" | sed -n "s/.*created install session \[\([0-9][0-9]*\)\].*/\1/p" | head -n1)
+                      if [ -z "${'$'}sid" ]; then
+                          echo "NO_SESSION: ${'$'}create_out"
+                      else
+                          pm path $pkg | sed -n 's/^package://p' | while IFS= read -r path; do
+                              size=$(stat -c%s "${'$'}path" 2>/dev/null || ls -l "${'$'}path" | awk '{print ${'$'}5}')
+                              split=$(basename "${'$'}path")
+                              cmd package install-write -S "${'$'}size" "${'$'}sid" "${'$'}split" "${'$'}path"
+                          done
+                          cmd package install-commit "${'$'}sid"
+                      fi
+                  """.trimIndent()
+                  return PrivilegedExecutor.runAsShellUid(context, script)
+              }
+
+              /**
+               * Roda `service call package <code> ...` via backend privilegiado,
+               * usando com.android.shell como pacote chamador (nao o nosso proprio
+               * pacote). O sucesso/falha de verdade e decidido depois, lendo
+               * getApplicationInfo().category -- essa funcao so executa e devolve
+               * a saida bruta pra diagnostico.
+               */
+              private fun runServiceCall(context: Context, code: Int, pkg: String, category: Int): String {
+                  val cmd = "service call package $code s16 $pkg i32 $category s16 $SHELL_PKG"
+                  return PrivilegedExecutor.runAsShellUid(context, cmd)
+              }
+
+              private fun getInstaller(context: Context, pkg: String): String? {
+                  // 2>/dev/null suprime o "Failed to write ... Broken pipe" que o
+                  // dumpsys imprime quando o grep -m1 fecha o pipe cedo. Alem disso,
+                  // pegamos so a PRIMEIRA linha que contem o marcador, em vez de tudo
+                  // que vem depois dele -- o "Broken pipe" as vezes grudava junto na
+                  // mesma string, fazendo a comparacao de igualdade falhar mesmo
+                  // quando o installer real já batia.
+                  val output = PrivilegedExecutor.runAsShellUid(context, "dumpsys package $pkg 2>/dev/null | grep -m1 installerPackageName")
+                  val line = output.lineSequence().firstOrNull { it.contains("installerPackageName=") } ?: return null
+                  val value = line.substringAfter("installerPackageName=", "").trim()
+                  return value.ifBlank { null }
+              }
+
+              private fun getSavedCode(context: Context): Int? {
+                  val v = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).getInt(KEY_CODE, -1)
+                  return if (v == -1) null else v
+              }
+
+              private fun saveCode(context: Context, code: Int) {
+                  context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                      .edit().putInt(KEY_CODE, code).apply()
+              }
+          }
+          EOF
+
+      - name: Patch MainActivity.kt and SettingsActivity.kt
+        run: |
+          cat > app/src/main/java/com/game/reschange/MainActivity.kt << 'EOF'
+          package com.game.reschange
+
+          import android.content.Intent
+          import android.content.pm.ApplicationInfo
+          import android.content.pm.PackageManager
+          import android.os.Bundle
+          import android.view.Menu
+          import android.view.MenuItem
+          import android.view.View
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import com.google.android.material.slider.Slider
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.recyclerview.widget.LinearLayoutManager
+          import androidx.recyclerview.widget.RecyclerView
+          import com.google.android.material.dialog.MaterialAlertDialogBuilder
+          import com.google.android.material.switchmaterial.SwitchMaterial
+          import java.util.Locale
+          import androidx.appcompat.widget.SearchView
+          import androidx.core.view.WindowCompat
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var recyclerView: RecyclerView
+              private lateinit var adapter: AppListAdapter
+              private lateinit var toggleModified: SwitchMaterial
+              private lateinit var allApps: List<AppInfo>
+              private var showOnlyModified = false
+              private var currentQuery: String = ""
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  // Primeira execucao: manda escolher Root ou Shizuku antes de
+                  // mostrar qualquer outra tela.
+                  if (!BackendPrefs.isChooserDone(this)) {
+                      startActivity(Intent(this, BackendChooserActivity::class.java))
+                      finish()
+                      return
+                  }
+
+                  WindowCompat.setDecorFitsSystemWindows(window, false)
+                  setContentView(R.layout.activity_main)
+                  setSupportActionBar(findViewById(R.id.myToolbar))
+                  supportActionBar?.subtitle = BackendPrefs.label(this)
+
+                  recyclerView   = findViewById(R.id.appList)
+                  toggleModified = findViewById(R.id.toggleModified)
+                  recyclerView.layoutManager = LinearLayoutManager(this)
+
+                  allApps = getUserInstalledApps()
+                  adapter = AppListAdapter(emptyList()) { appInfo ->
+                      showResolutionDialog(appInfo.packageName)
+                  }
+                  recyclerView.adapter = adapter
+                  filterAppList()
+
+                  toggleModified.setOnCheckedChangeListener { _, isChecked ->
+                      showOnlyModified = isChecked
+                      filterAppList()
+                  }
+
+                  findViewById<Button>(R.id.resetButton).setOnClickListener {
+                      val packages = ResChangePrefs.getAllPackages(this)
+                      for (pkg in packages) {
+                          PrivilegedExecutor.run(this, buildDisableCommand(pkg))
+                          PrivilegedExecutor.run(this, "am force-stop $pkg")
+                      }
+                      ResChangePrefs.clearAll(this)
+                      adapter.notifyDataSetChanged()
+                      Toast.makeText(this, "All resolutions reset to default", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  // Reflete aqui caso o usuario tenha trocado o backend na tela de
+                  // Settings e voltado -- o subtitulo do toolbar sempre mostra o
+                  // que esta realmente ativo agora.
+                  supportActionBar?.subtitle = BackendPrefs.label(this)
+              }
+
+              override fun onCreateOptionsMenu(menu: Menu): Boolean {
+                  menuInflater.inflate(R.menu.menu_main, menu)
+                  val searchItem = menu.findItem(R.id.action_search)
+                  val searchView = searchItem?.actionView as? SearchView
+                  searchView?.setOnQueryTextListener(object : SearchView.OnQueryTextListener {
+                      override fun onQueryTextSubmit(query: String?) = true
+                      override fun onQueryTextChange(newText: String?): Boolean {
+                          currentQuery = newText.orEmpty()
+                          filterAppList()
+                          return true
+                      }
+                  })
+                  return true
+              }
+
+              override fun onOptionsItemSelected(item: MenuItem): Boolean {
+                  if (item.itemId == R.id.action_settings) {
+                      startActivity(Intent(this, SettingsActivity::class.java))
+                      return true
+                  }
+                  return super.onOptionsItemSelected(item)
+              }
+
+              private fun filterAppList() {
+                  var list = allApps
+                  if (showOnlyModified)
+                      list = list.filter { ResChangePrefs.getScale(this, it.packageName) < 1.0f }
+                  if (currentQuery.isNotEmpty()) {
+                      val q = currentQuery.lowercase(Locale.getDefault())
+                      list = list.filter {
+                          it.name.lowercase().contains(q) || it.packageName.lowercase().contains(q)
+                      }
+                  }
+
+                  // Jogos em cima, outros apps embaixo, cada grupo com seu cabecalho
+                  val games = list.filter { it.isGame }
+                  val others = list.filter { !it.isGame }
+                  val sectioned = mutableListOf<ListItem>()
+                  if (games.isNotEmpty()) {
+                      sectioned.add(ListItem.Header("🎮 Jogos"))
+                      sectioned.addAll(games.map { ListItem.App(it) })
+                  }
+                  if (others.isNotEmpty()) {
+                      sectioned.add(ListItem.Header("📱 Outros apps"))
+                      sectioned.addAll(others.map { ListItem.App(it) })
+                  }
+                  adapter.submitList(sectioned)
+              }
+
+              // Lista TODOS os apps instalados -- nao so os com icone de launcher
+              private fun getUserInstalledApps(): List<AppInfo> {
+                  val pm = packageManager
+                  return pm.getInstalledApplications(PackageManager.GET_META_DATA)
+                      .filter { app ->
+                          (app.flags and ApplicationInfo.FLAG_SYSTEM) == 0 &&
+                          app.packageName != packageName
+                      }
+                      .distinctBy { it.packageName }
+                      .map { app ->
+                          AppInfo(
+                              name = pm.getApplicationLabel(app).toString(),
+                              packageName = app.packageName,
+                              icon = try { pm.getApplicationIcon(app) }
+                                     catch (_: Exception) { pm.defaultActivityIcon },
+                              isGame = app.category == GameCategoryHint.CATEGORY_GAME
+                          )
+                      }
+                      .sortedBy { it.name.lowercase() }
+              }
+
+              // Recarrega a lista de apps (usado apos forcar/remover categoria de jogo,
+              // pra mover o app pra secao certa imediatamente)
+              private fun refreshAppList() {
+                  allApps = getUserInstalledApps()
+                  filterAppList()
+              }
+
+              private fun showResolutionDialog(packageName: String) {
+                  val savedScale = ResChangePrefs.getScale(this, packageName)
+                  val isAlt      = ModePrefs.isAlternative(this)
+                  val modeLabel  = if (isAlt) "Alternative" else "Default"
+                  val appName    = allApps.find { it.packageName == packageName }?.name ?: packageName
+
+                  val layout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(50, 40, 50, 10)
+                  }
+
+                  val modeText = TextView(this).apply {
+                      textSize = 12f
+                      setPadding(0, 0, 0, 8)
+                      text = "Mode: $modeLabel"
+                      setTextColor(0xFF888888.toInt())
+                  }
+
+                  val scaleText = TextView(this).apply {
+                      textSize = 18f
+                      setPadding(0, 0, 0, 20)
+                      text = "Scale: ${(savedScale * 100).toInt()}%"
+                  }
+
+                  val slider = Slider(this).apply {
+                      valueFrom    = 0.3f
+                      valueTo      = 1.0f
+                      stepSize     = 0.05f
+                      value        = savedScale
+                      isTickVisible = true
+                  }
+
+                  slider.addOnChangeListener { _, value, _ ->
+                      scaleText.text = "Scale: ${(value * 100).toInt()}%"
+                  }
+
+                  // ── Forcar/Remover categoria de jogo (estilo TMPAD) ─────────────────
+                  // Chama o metodo oculto setApplicationCategoryHint via transacao
+                  // Binder crua, testando os codigos de transacao conhecidos.
+                  val categoryDivider = TextView(this).apply {
+                      setPadding(0, 24, 0, 4)
+                      text = "— Game Category —"
+                      textSize = 12f
+                      setTextColor(0xFF888888.toInt())
+                  }
+
+                  val categoryStatus = TextView(this).apply {
+                      textSize = 13f
+                      setPadding(0, 0, 0, 10)
+                  }
+
+                  val categoryButton = Button(this)
+
+                  // 3 estados possiveis:
+                  // 1) Ja e jogo nativo (o sistema ja reconhece) -> nao mostra botao
+                  // 2) Fomos nos que forcamos -> mostra "Remover categoria de jogo"
+                  // 3) Nao e jogo -> mostra "Forçar categoria de jogo"
+                  fun refreshCategoryUi() {
+                      val isGame = GameCategoryHint.isActuallyGame(this, packageName)
+                      val isForced = GameCategoryHint.isForcedByUs(this, packageName)
+
+                      when {
+                          isGame && !isForced -> {
+                              categoryStatus.text = "Este app já é reconhecido como jogo pelo sistema."
+                              categoryButton.visibility = View.GONE
+                          }
+                          isGame && isForced -> {
+                              categoryStatus.text = "Categoria de jogo forçada por este app."
+                              categoryButton.visibility = View.VISIBLE
+                              categoryButton.text = "Remover categoria de jogo"
+                          }
+                          else -> {
+                              categoryStatus.text = "Toque em \"Forçar categoria de jogo\" se o app não aplicar a resolução."
+                              categoryButton.visibility = View.VISIBLE
+                              categoryButton.text = "Forçar categoria de jogo"
+                          }
+                      }
+                  }
+                  refreshCategoryUi()
+
+                  categoryButton.setOnClickListener {
+                      val willForce = !GameCategoryHint.isForcedByUs(this, packageName)
+                      categoryButton.isEnabled = false
+                      categoryButton.text = "Testando…"
+                      // Trabalho de root/Shizuku/Binder fora da main thread pra nao travar a UI
+                      Thread {
+                          val result = if (willForce)
+                              GameCategoryHint.forceGameCategory(this, packageName)
+                          else
+                              GameCategoryHint.removeGameCategory(this, packageName)
+
+                          if (result.success) {
+                              // Agora que a categoria mudou, reaplica a escala (se ja
+                              // tiver uma salva) e reinicia o app, pra dar a melhor
+                              // chance do cmd game mode pegar a mudanca na proxima
+                              // vez que o jogo abrir.
+                              val scale = ResChangePrefs.getScale(this, packageName)
+                              if (scale < 1.0f) {
+                                  PrivilegedExecutor.run(this, buildApplyCommand(packageName, scale))
+                              }
+                              PrivilegedExecutor.run(this, "am force-stop $packageName")
+                          }
+
+                          runOnUiThread {
+                              categoryButton.isEnabled = true
+                              if (result.success) {
+                                  refreshCategoryUi()
+                                  refreshAppList()
+                                  Toast.makeText(this, result.message, Toast.LENGTH_SHORT).show()
+                              } else {
+                                  refreshCategoryUi()
+                                  categoryStatus.text = "Falhou. Veja o erro completo no diálogo que abriu."
+                                  showFullErrorDialog("Categoria de jogo — erro", result.message)
+                              }
+                          }
+                      }.start()
+                  }
+
+                  layout.addView(modeText)
+                  layout.addView(scaleText)
+                  layout.addView(slider)
+                  layout.addView(categoryDivider)
+                  layout.addView(categoryStatus)
+                  layout.addView(categoryButton)
+
+                  MaterialAlertDialogBuilder(this, R.style.MyRoundedDialog)
+                      .setTitle("Set Resolution Scale")
+                      .setView(layout)
+                      .setPositiveButton("Apply") { _, _ ->
+                          var scale = String.format(Locale.US, "%.2f", slider.value).toFloat()
+
+                          if (scale == 0.95f) {
+                              scale = 0.9f
+                              Toast.makeText(this, "95% not supported. Using 90%.", Toast.LENGTH_SHORT).show()
+                          }
+
+                          if (scale >= 1.0f) {
+                              PrivilegedExecutor.run(this, buildDisableCommand(packageName))
+                              ResChangePrefs.removeScale(this, packageName)
+                              Toast.makeText(this, "Resolution reset to 100% for $appName", Toast.LENGTH_SHORT).show()
+                          } else {
+                              PrivilegedExecutor.run(this, buildApplyCommand(packageName, scale))
+                              ResChangePrefs.saveScale(this, packageName, scale)
+                              Toast.makeText(this,
+                                  "${(scale * 100).toInt()}% applied for $appName [$modeLabel Mode]",
+                                  Toast.LENGTH_SHORT).show()
+                          }
+
+                          adapter.notifyDataSetChanged()
+                          PrivilegedExecutor.run(this, "am force-stop $packageName")
+                          Toast.makeText(this, "$appName stopped. Relaunch to apply.", Toast.LENGTH_LONG).show()
+                      }
+                      .setNegativeButton("Cancel", null)
+                      .setNeutralButton("Reset") { _, _ ->
+                          PrivilegedExecutor.run(this, buildDisableCommand(packageName))
+                          ResChangePrefs.removeScale(this, packageName)
+                          adapter.notifyDataSetChanged()
+                          PrivilegedExecutor.run(this, "am force-stop $packageName")
+                          Toast.makeText(this, "$appName reset to 100%. Relaunch to apply.", Toast.LENGTH_LONG).show()
+                      }
+                      .show()
+              }
+
+              // Fluxo oficial confirmado na documentacao Android Developers
+              // (developer.android.com/games/optimize/adpf/gamemode/gamemode-interventions):
+              // 1) device_config put game_overlay configura o downscale para os modos
+              //    2 (Performance) e 3 (Battery Saver)
+              // 2) cmd game mode <performance|standard> ATIVA o modo pro pacote --
+              //    sem esse passo a configuracao fica salva mas nunca e aplicada.
+              // Sem Xposed reaplicando a config a cada abertura do app, o GMS pode
+              // sobrescrever o device_config periodicamente com o tempo. Desabilitar
+              // a sincronizacao do namespace game_overlay evita isso.
+              private fun buildApplyCommand(pkg: String, scale: Float): String {
+                  val scaleStr = String.format(Locale.US, "%.2f", scale)
+                  val configCmd = "device_config put game_overlay $pkg " +
+                      "mode=2,downscaleFactor=$scaleStr:mode=3,downscaleFactor=$scaleStr"
+                  val activateCmd = "cmd game mode performance $pkg"
+                  val syncCmd = "device_config set_sync_disabled_for_tests persistent"
+                  return "$configCmd; $activateCmd; $syncCmd"
+              }
+
+              // Volta o pacote para o modo "standard" (sem downscale) e remove a config
+              private fun buildDisableCommand(pkg: String): String {
+                  return "cmd game mode standard $pkg; device_config delete game_overlay $pkg"
+              }
+
+              // Mostra o texto de erro completo (o Toast corta mensagens longas).
+              // TextView selecionável + botão de copiar, pra facilitar mandar o erro.
+              private fun showFullErrorDialog(title: String, message: String) {
+                  val textView = TextView(this).apply {
+                      text = message
+                      setPadding(50, 30, 50, 30)
+                      setTextIsSelectable(true)
+                      textSize = 13f
+                  }
+                  val scroll = android.widget.ScrollView(this).apply { addView(textView) }
+
+                  MaterialAlertDialogBuilder(this, R.style.MyRoundedDialog)
+                      .setTitle(title)
+                      .setView(scroll)
+                      .setPositiveButton("Copiar") { _, _ ->
+                          val clipboard = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                          clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Erro", message))
+                          Toast.makeText(this, "Erro copiado", Toast.LENGTH_SHORT).show()
+                      }
+                      .setNegativeButton("Fechar", null)
+                      .show()
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/game/reschange/SettingsActivity.kt << 'EOF'
+          package com.game.reschange
+
+          import android.os.Bundle
+          import android.widget.RadioButton
+          import android.widget.RadioGroup
+          import android.widget.Toast
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.view.WindowCompat
+
+          class SettingsActivity : AppCompatActivity() {
+
+              private var awaitingShizukuPermission = false
+              private var revertingBackendSelection = false
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  WindowCompat.setDecorFitsSystemWindows(window, false)
+                  setContentView(R.layout.activity_settings)
+                  setSupportActionBar(findViewById(R.id.settingsToolbar))
+                  supportActionBar?.setDisplayHomeAsUpEnabled(true)
+                  supportActionBar?.title = "Operation Mode"
+
+                  val radioGroup    = findViewById<RadioGroup>(R.id.radioGroupMode)
+                  val radioDefault  = findViewById<RadioButton>(R.id.radioDefault)
+                  val radioAlt      = findViewById<RadioButton>(R.id.radioAlternative)
+
+                  // Marca o modo atual
+                  val currentMode = ModePrefs.getMode(this)
+                  if (currentMode == ModePrefs.MODE_ALTERNATIVE) {
+                      radioAlt.isChecked = true
+                  } else {
+                      radioDefault.isChecked = true
+                  }
+
+                  radioGroup.setOnCheckedChangeListener { _, checkedId ->
+                      val newMode = when (checkedId) {
+                          R.id.radioAlternative -> ModePrefs.MODE_ALTERNATIVE
+                          else                  -> ModePrefs.MODE_DEFAULT
+                      }
+
+                      ModePrefs.saveMode(this, newMode)
+
+                      // Salva o modo em arquivo world-readable (referencia legada)
+                      writeModeFile(newMode)
+
+                      if (newMode == ModePrefs.MODE_ALTERNATIVE) {
+                          // Desabilita a sincronizacao do GMS para o namespace game_overlay
+                          // Isso resolve o problema de "depois de um tempo tem que reativar tudo"
+                          // O GMS sobrescreve device_config periodicamente -- isso impede isso
+                          PrivilegedExecutor.run(this, "device_config set_sync_disabled_for_tests persistent")
+                          Toast.makeText(this,
+                              "Alternative Mode enabled.\nGMS sync disabled for game_overlay.",
+                              Toast.LENGTH_LONG).show()
+                      } else {
+                          // Reabilita sincronizacao ao voltar pro Default Mode
+                          PrivilegedExecutor.run(this, "device_config set_sync_disabled_for_tests none")
+                          Toast.makeText(this,
+                              "Default Mode enabled.",
+                              Toast.LENGTH_SHORT).show()
+                      }
+                  }
+
+                  setupBackendSelector()
+              }
+
+              /**
+               * Segundo seletor da tela: qual backend privilegiado usar (root ou
+               * Shizuku). Independente do RadioGroup de Default/Alternative acima --
+               * um decide COMO a resolucao e aplicada, o outro decide COM QUE
+               * PERMISSAO.
+               */
+              private fun setupBackendSelector() {
+                  val radioGroupBackend = findViewById<RadioGroup>(R.id.radioGroupBackend)
+                  val radioRoot          = findViewById<RadioButton>(R.id.radioRoot)
+                  val radioShizuku       = findViewById<RadioButton>(R.id.radioShizuku)
+
+                  fun applySelectionSilently(backend: String) {
+                      revertingBackendSelection = true
+                      if (backend == BackendPrefs.BACKEND_SHIZUKU) radioShizuku.isChecked = true else radioRoot.isChecked = true
+                      revertingBackendSelection = false
+                  }
+
+                  applySelectionSilently(BackendPrefs.getBackend(this))
+
+                  radioGroupBackend.setOnCheckedChangeListener { _, checkedId ->
+                      if (revertingBackendSelection) return@setOnCheckedChangeListener
+
+                      when (checkedId) {
+                          R.id.radioShizuku -> {
+                              when {
+                                  ShizukuExecutor.hasPermission() -> {
+                                      BackendPrefs.saveBackend(this, BackendPrefs.BACKEND_SHIZUKU)
+                                      Toast.makeText(this, "Backend: Shizuku", Toast.LENGTH_SHORT).show()
+                                  }
+                                  ShizukuExecutor.isAvailable() -> {
+                                      awaitingShizukuPermission = true
+                                      ShizukuExecutor.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE)
+                                      Toast.makeText(this,
+                                          "Conceda a permissão do Shizuku na tela que abriu.",
+                                          Toast.LENGTH_LONG).show()
+                                  }
+                                  else -> {
+                                      Toast.makeText(this,
+                                          "Shizuku não detectado. Instale e inicie o Shizuku antes de usar esse modo.",
+                                          Toast.LENGTH_LONG).show()
+                                      applySelectionSilently(BackendPrefs.BACKEND_ROOT)
+                                  }
+                              }
+                          }
+                          else -> {
+                              BackendPrefs.saveBackend(this, BackendPrefs.BACKEND_ROOT)
+                              Toast.makeText(this, "Backend: Root", Toast.LENGTH_SHORT).show()
+                          }
+                      }
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  if (awaitingShizukuPermission) {
+                      awaitingShizukuPermission = false
+                      val radioRoot    = findViewById<RadioButton>(R.id.radioRoot)
+                      val radioShizuku = findViewById<RadioButton>(R.id.radioShizuku)
+                      if (ShizukuExecutor.hasPermission()) {
+                          BackendPrefs.saveBackend(this, BackendPrefs.BACKEND_SHIZUKU)
+                          revertingBackendSelection = true
+                          radioShizuku.isChecked = true
+                          revertingBackendSelection = false
+                          Toast.makeText(this, "Backend: Shizuku", Toast.LENGTH_SHORT).show()
+                      } else {
+                          revertingBackendSelection = true
+                          radioRoot.isChecked = true
+                          revertingBackendSelection = false
+                          Toast.makeText(this, "Permissão do Shizuku não concedida.", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+              }
+
+              override fun onSupportNavigateUp(): Boolean {
+                  onBackPressedDispatcher.onBackPressed()
+                  return true
+              }
+
+              /**
+               * Grava /data/local/tmp/reschange_mode.txt com chmod 644
+               * para qualquer processo ler (sem uso atual, mantido por compatibilidade).
+               */
+              private fun writeModeFile(mode: String) {
+                  try {
+                      val tmp = java.io.File(cacheDir, "reschange_mode.txt")
+                      tmp.writeText(mode)
+                      PrivilegedExecutor.run(this,
+                          "cp ${tmp.absolutePath} /data/local/tmp/reschange_mode.txt && chmod 644 /data/local/tmp/reschange_mode.txt")
+                  } catch (_: Exception) {}
+              }
+
+              companion object {
+                  private const val SHIZUKU_PERMISSION_REQUEST_CODE = 8899
+              }
+          }
+          EOF
+
+      - name: Patch layout XML files
+        run: |
+          cat > app/src/main/res/layout/activity_main.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:app="http://schemas.android.com/apk/res-auto"
+              xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/rootLayout"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:padding="16dp"
+              android:fitsSystemWindows="true">
+
+          <androidx.appcompat.widget.Toolbar
+                  android:id="@+id/myToolbar"
+                  android:layout_width="match_parent"
+                  android:layout_height="?attr/actionBarSize"
+                  android:background="?attr/colorSurface"
+                  app:titleTextColor="?android:attr/textColorPrimary"
+                  app:subtitleTextColor="?android:attr/textColorSecondary"
+                  app:popupTheme="@style/ThemeOverlay.MaterialComponents.Light" />
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="horizontal"
+                  android:gravity="center_vertical"
+                  android:paddingStart="16dp"
+                  android:paddingEnd="16dp"
+                  android:paddingTop="8dp"
+                  android:paddingBottom="8dp">
+
+                  <com.google.android.material.switchmaterial.SwitchMaterial
+                      android:id="@+id/toggleModified"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:minWidth="0dp"
+                      android:text="Show only modified apps"
+                      android:paddingStart="8dp"
+                      android:paddingEnd="0dp"
+                      android:includeFontPadding="false" />
+
+                  <View
+                      android:layout_width="0dp"
+                      android:layout_height="0dp"
+                      android:layout_weight="1" />
+
+                  <com.google.android.material.button.MaterialButton
+                      android:id="@+id/resetButton"
+                      style="@style/Widget.MaterialComponents.Button"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:minWidth="0dp"
+                      android:paddingHorizontal="12dp"
+                      android:text="Reset settings"
+                      android:textSize="12sp"
+                      android:layout_marginStart="8dp"
+                      android:backgroundTint="@color/button_dark_blue" />
+              </LinearLayout>
+
+
+              <androidx.recyclerview.widget.RecyclerView
+                  android:id="@+id/appList"
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent"/>
+          </LinearLayout>
+          EOF
+
+          cat > app/src/main/res/layout/activity_settings.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:app="http://schemas.android.com/apk/res-auto"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:fitsSystemWindows="true">
+
+              <androidx.appcompat.widget.Toolbar
+                  android:id="@+id/settingsToolbar"
+                  android:layout_width="match_parent"
+                  android:layout_height="?attr/actionBarSize"
+                  android:background="?attr/colorSurface"
+                  app:titleTextColor="?android:attr/textColorPrimary"
+                  app:popupTheme="@style/ThemeOverlay.MaterialComponents.Light" />
+
+              <ScrollView
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent">
+
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:orientation="vertical"
+                      android:padding="20dp">
+
+                      <TextView
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:text="Selecione como as intervenções do app são aplicadas.\nA alteração de modos exigirá a reaplicação de todos os apps."
+                          android:textSize="14sp"
+                          android:textColor="?android:attr/textColorSecondary"
+                          android:paddingBottom="20dp" />
+
+                      <!-- Default Mode -->
+                      <androidx.cardview.widget.CardView
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginBottom="16dp"
+                          app:cardCornerRadius="12dp"
+                          app:cardElevation="2dp">
+
+                          <LinearLayout
+                              android:layout_width="match_parent"
+                              android:layout_height="wrap_content"
+                              android:orientation="vertical"
+                              android:padding="16dp">
+
+                              <RadioGroup
+                                  android:id="@+id/radioGroupMode"
+                                  android:layout_width="match_parent"
+                                  android:layout_height="wrap_content"
+                                  android:orientation="vertical">
+
+                                  <RadioButton
+                                      android:id="@+id/radioDefault"
+                                      android:layout_width="match_parent"
+                                      android:layout_height="wrap_content"
+                                      android:text="Default Mode"
+                                      android:textStyle="bold"
+                                      android:textSize="16sp"
+                                      android:paddingBottom="8dp" />
+
+                                  <TextView
+                                      android:layout_width="match_parent"
+                                      android:layout_height="wrap_content"
+                                      android:text="• Usa comandos cmd game downscale\n• Recomendado para a maioria dos usuários\n• Funciona de forma confiável a partir do Android 14\n• Mais estável e bem testado\n• Reaplicado automaticamente ao abrir o app"
+                                      android:textSize="13sp"
+                                      android:textColor="?android:attr/textColorSecondary"
+                                      android:paddingStart="32dp"
+                                      android:paddingBottom="16dp" />
+
+                                  <!-- Alternative Mode -->
+                                  <RadioButton
+                                      android:id="@+id/radioAlternative"
+                                      android:layout_width="match_parent"
+                                      android:layout_height="wrap_content"
+                                      android:text="Alternative Mode"
+                                      android:textStyle="bold"
+                                      android:textSize="16sp"
+                                      android:paddingBottom="8dp" />
+
+                                  <TextView
+                                      android:layout_width="match_parent"
+                                      android:layout_height="wrap_content"
+                                      android:text="• Usa comandos device_config game_overlay\n• Desabilita sincronização GMS (resolve o bug de reativar)\n• Suporte experimental para Android 13+\n• Pode não funcionar em todas as ROMs\n• Reaplicado automaticamente ao abrir o app"
+                                      android:textSize="13sp"
+                                      android:textColor="?android:attr/textColorSecondary"
+                                      android:paddingStart="32dp" />
+
+                              </RadioGroup>
+                          </LinearLayout>
+                      </androidx.cardview.widget.CardView>
+
+                      <TextView
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:text="Backend de permissão"
+                          android:textStyle="bold"
+                          android:textSize="14sp"
+                          android:paddingBottom="8dp" />
+
+                      <TextView
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:text="Com que privilégio os comandos acima são executados."
+                          android:textSize="13sp"
+                          android:textColor="?android:attr/textColorSecondary"
+                          android:paddingBottom="12dp" />
+
+                      <!-- Backend: Root ou Shizuku -->
+                      <androidx.cardview.widget.CardView
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:layout_marginBottom="16dp"
+                          app:cardCornerRadius="12dp"
+                          app:cardElevation="2dp">
+
+                          <LinearLayout
+                              android:layout_width="match_parent"
+                              android:layout_height="wrap_content"
+                              android:orientation="vertical"
+                              android:padding="16dp">
+
+                              <RadioGroup
+                                  android:id="@+id/radioGroupBackend"
+                                  android:layout_width="match_parent"
+                                  android:layout_height="wrap_content"
+                                  android:orientation="vertical">
+
+                                  <RadioButton
+                                      android:id="@+id/radioRoot"
+                                      android:layout_width="match_parent"
+                                      android:layout_height="wrap_content"
+                                      android:text="Root"
+                                      android:textStyle="bold"
+                                      android:textSize="16sp"
+                                      android:paddingBottom="8dp" />
+
+                                  <TextView
+                                      android:layout_width="match_parent"
+                                      android:layout_height="wrap_content"
+                                      android:text="• Usa su (Magisk/KernelSU)\n• Exige o aparelho já ter root\n• Watcher sobrevive independente do app"
+                                      android:textSize="13sp"
+                                      android:textColor="?android:attr/textColorSecondary"
+                                      android:paddingStart="32dp"
+                                      android:paddingBottom="16dp" />
+
+                                  <RadioButton
+                                      android:id="@+id/radioShizuku"
+                                      android:layout_width="match_parent"
+                                      android:layout_height="wrap_content"
+                                      android:text="Shizuku"
+                                      android:textStyle="bold"
+                                      android:textSize="16sp"
+                                      android:paddingBottom="8dp" />
+
+                                  <TextView
+                                      android:layout_width="match_parent"
+                                      android:layout_height="wrap_content"
+                                      android:text="• Não precisa de root\n• Exige o app Shizuku instalado e ativo\n• Ativado via ADB (PC) ou depuração sem fio (Android 11+)"
+                                      android:textSize="13sp"
+                                      android:textColor="?android:attr/textColorSecondary"
+                                      android:paddingStart="32dp" />
+
+                              </RadioGroup>
+                          </LinearLayout>
+                      </androidx.cardview.widget.CardView>
+
+                  </LinearLayout>
+              </ScrollView>
+          </LinearLayout>
+          EOF
+
+      - name: Patch AndroidManifest.xml and app/build.gradle.kts
+        run: |
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+
+              <application
+                  android:allowBackup="true"
+                  android:dataExtractionRules="@xml/data_extraction_rules"
+                  android:fullBackupContent="@xml/backup_rules"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="GameResChange"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.YourAppName"
+                  tools:targetApi="31">
+
+                  <activity
+                      android:name=".BackendChooserActivity"
+                      android:exported="false"
+                      android:theme="@style/Theme.YourAppName" />
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:theme="@style/Theme.YourAppName">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity
+                      android:name=".SettingsActivity"
+                      android:exported="false"
+                      android:label="Settings"
+                      android:theme="@style/Theme.YourAppName" />
+
+                  <receiver
+                      android:name=".BootReceiver"
+                      android:exported="false">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                      </intent-filter>
+                  </receiver>
+
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:multiprocess="false"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+              </application>
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+          </manifest>
+          EOF
+
+          cat > app/build.gradle.kts << 'EOF'
+
+
+          plugins {
+              alias(libs.plugins.android.application)
+              alias(libs.plugins.kotlin.android)
+              alias(libs.plugins.kotlin.compose)
+          }
+
+          android {
+              namespace = "com.game.reschange"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.game.reschange.fork"
+                  minSdk = 31
+                  targetSdk = 35
+                  versionCode = __VERSION_CODE__
+                  versionName = "__VERSION_NAME__"
+
+                  testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+              }
+
+              // Don't fail the build on lint errors
+              // Skip lint in release builds
+              // disable specific checks:
+              lint {
+                  abortOnError = false         // Don't fail the build on errors
+                  checkReleaseBuilds = false   // Disable lint for release builds
+                  disable.addAll(listOf("MissingTranslation", "UnusedResources")) // Disable specific checks
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = true
+                      isShrinkResources = true
+                      proguardFiles(
+                          getDefaultProguardFile("proguard-android-optimize.txt"),
+                          "proguard-rules.pro"
+                      )
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              buildFeatures {
+                  compose = true
+                  aidl = true
+              }
+          }
+
+          dependencies {
+
+              implementation(libs.androidx.core.ktx)
+              implementation(libs.androidx.lifecycle.runtime.ktx)
+              implementation(libs.androidx.activity.compose)
+              implementation(platform(libs.androidx.compose.bom))
+              implementation(libs.androidx.ui)
+              implementation(libs.androidx.ui.graphics)
+              implementation(libs.androidx.ui.tooling.preview)
+              implementation(libs.androidx.material3)
+              implementation(libs.androidx.recyclerview)
+              implementation(libs.androidx.appcompat)
+              implementation("com.google.android.material:material:1.11.0")
+              implementation("dev.rikka.shizuku:api:13.1.5")
+              implementation("dev.rikka.shizuku:provider:13.1.5")
+              testImplementation(libs.junit)
+              androidTestImplementation(libs.androidx.junit)
+              androidTestImplementation(libs.androidx.espresso.core)
+              androidTestImplementation(platform(libs.androidx.compose.bom))
+              androidTestImplementation(libs.androidx.ui.test.junit4)
+              debugImplementation(libs.androidx.ui.tooling)
+              debugImplementation(libs.androidx.ui.test.manifest)
+          }
+          EOF
+
+          sed -i "s/__VERSION_CODE__/${{ steps.version.outputs.code }}/" app/build.gradle.kts
+          sed -i "s/__VERSION_NAME__/${{ steps.version.outputs.name }}/" app/build.gradle.kts
+
+      - name: Fix local.properties for the CI runner
+        run: echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+      - name: Build debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && echo "Nada para commitar" || git commit -m "Adiciona backend Shizuku como alternativa ao root (v${{ steps.version.outputs.name }})"
+          git push
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-shizuku
+          path: app/build/outputs/apk/debug/*.apk
