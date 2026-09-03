@@ -17,8 +17,6 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.switchmaterial.SwitchMaterial
-import java.io.DataOutputStream
-import java.io.File
 import java.util.Locale
 import androidx.appcompat.widget.SearchView
 import androidx.core.view.WindowCompat
@@ -34,9 +32,19 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Primeira execucao: manda escolher Root ou Shizuku antes de
+        // mostrar qualquer outra tela.
+        if (!BackendPrefs.isChooserDone(this)) {
+            startActivity(Intent(this, BackendChooserActivity::class.java))
+            finish()
+            return
+        }
+
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContentView(R.layout.activity_main)
         setSupportActionBar(findViewById(R.id.myToolbar))
+        supportActionBar?.subtitle = BackendPrefs.label(this)
 
         recyclerView   = findViewById(R.id.appList)
         toggleModified = findViewById(R.id.toggleModified)
@@ -57,13 +65,21 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.resetButton).setOnClickListener {
             val packages = ResChangePrefs.getAllPackages(this)
             for (pkg in packages) {
-                runAsRoot(buildDisableCommand(pkg))
-                runAsRoot("am force-stop $pkg")
+                PrivilegedExecutor.run(this, buildDisableCommand(pkg))
+                PrivilegedExecutor.run(this, "am force-stop $pkg")
             }
             ResChangePrefs.clearAll(this)
             adapter.notifyDataSetChanged()
             Toast.makeText(this, "All resolutions reset to default", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Reflete aqui caso o usuario tenha trocado o backend na tela de
+        // Settings e voltado -- o subtitulo do toolbar sempre mostra o
+        // que esta realmente ativo agora.
+        supportActionBar?.subtitle = BackendPrefs.label(this)
     }
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
@@ -115,7 +131,7 @@ class MainActivity : AppCompatActivity() {
         adapter.submitList(sectioned)
     }
 
-    // Lista TODOS os apps instalados — nao so os com icone de launcher
+    // Lista TODOS os apps instalados -- nao so os com icone de launcher
     private fun getUserInstalledApps(): List<AppInfo> {
         val pm = packageManager
         return pm.getInstalledApplications(PackageManager.GET_META_DATA)
@@ -227,7 +243,7 @@ class MainActivity : AppCompatActivity() {
             val willForce = !GameCategoryHint.isForcedByUs(this, packageName)
             categoryButton.isEnabled = false
             categoryButton.text = "Testando…"
-            // Trabalho de root/Binder fora da main thread pra nao travar a UI
+            // Trabalho de root/Shizuku/Binder fora da main thread pra nao travar a UI
             Thread {
                 val result = if (willForce)
                     GameCategoryHint.forceGameCategory(this, packageName)
@@ -241,9 +257,9 @@ class MainActivity : AppCompatActivity() {
                     // vez que o jogo abrir.
                     val scale = ResChangePrefs.getScale(this, packageName)
                     if (scale < 1.0f) {
-                        runAsRoot(buildApplyCommand(packageName, scale))
+                        PrivilegedExecutor.run(this, buildApplyCommand(packageName, scale))
                     }
-                    runAsRoot("am force-stop $packageName")
+                    PrivilegedExecutor.run(this, "am force-stop $packageName")
                 }
 
                 runOnUiThread {
@@ -280,11 +296,11 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 if (scale >= 1.0f) {
-                    runAsRoot(buildDisableCommand(packageName))
+                    PrivilegedExecutor.run(this, buildDisableCommand(packageName))
                     ResChangePrefs.removeScale(this, packageName)
                     Toast.makeText(this, "Resolution reset to 100% for $appName", Toast.LENGTH_SHORT).show()
                 } else {
-                    runAsRoot(buildApplyCommand(packageName, scale))
+                    PrivilegedExecutor.run(this, buildApplyCommand(packageName, scale))
                     ResChangePrefs.saveScale(this, packageName, scale)
                     Toast.makeText(this,
                         "${(scale * 100).toInt()}% applied for $appName [$modeLabel Mode]",
@@ -292,15 +308,15 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 adapter.notifyDataSetChanged()
-                runAsRoot("am force-stop $packageName")
+                PrivilegedExecutor.run(this, "am force-stop $packageName")
                 Toast.makeText(this, "$appName stopped. Relaunch to apply.", Toast.LENGTH_LONG).show()
             }
             .setNegativeButton("Cancel", null)
             .setNeutralButton("Reset") { _, _ ->
-                runAsRoot(buildDisableCommand(packageName))
+                PrivilegedExecutor.run(this, buildDisableCommand(packageName))
                 ResChangePrefs.removeScale(this, packageName)
                 adapter.notifyDataSetChanged()
-                runAsRoot("am force-stop $packageName")
+                PrivilegedExecutor.run(this, "am force-stop $packageName")
                 Toast.makeText(this, "$appName reset to 100%. Relaunch to apply.", Toast.LENGTH_LONG).show()
             }
             .show()
@@ -310,7 +326,7 @@ class MainActivity : AppCompatActivity() {
     // (developer.android.com/games/optimize/adpf/gamemode/gamemode-interventions):
     // 1) device_config put game_overlay configura o downscale para os modos
     //    2 (Performance) e 3 (Battery Saver)
-    // 2) cmd game mode <performance|standard> ATIVA o modo pro pacote —
+    // 2) cmd game mode <performance|standard> ATIVA o modo pro pacote --
     //    sem esse passo a configuracao fica salva mas nunca e aplicada.
     // Sem Xposed reaplicando a config a cada abertura do app, o GMS pode
     // sobrescrever o device_config periodicamente com o tempo. Desabilitar
@@ -350,19 +366,5 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton("Fechar", null)
             .show()
-    }
-
-    private fun runAsRoot(command: String) {
-        try {
-            val process = Runtime.getRuntime().exec("su")
-            val os = DataOutputStream(process.outputStream)
-            os.writeBytes("$command\n")
-            os.writeBytes("exit\n")
-            os.flush()
-            os.close()
-            process.waitFor()
-        } catch (e: Exception) {
-            Toast.makeText(this, "Root failed: ${e.message}", Toast.LENGTH_LONG).show()
-        }
     }
 }
