@@ -11,11 +11,11 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.game.reschange"
+        applicationId = "com.game.reschange.fork"
         minSdk = 31
         targetSdk = 35
-        versionCode = 6
-        versionName = "1.5"
+        versionCode = 1
+        versionName = "0.17"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -63,7 +63,6 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
     implementation(libs.androidx.recyclerview)
-    compileOnly("de.robv.android.xposed:api:82")
     implementation(libs.androidx.appcompat)
     implementation("com.google.android.material:material:1.11.0")
     testImplementation(libs.junit)
